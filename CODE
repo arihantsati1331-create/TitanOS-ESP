@@ -1,0 +1,1082 @@
+/*
+  ESP32 Mini OS for a 2.8" ILI9341 TFT with XPT2046 touch.
+
+  Libraries to install in Arduino IDE:
+  - Adafruit GFX Library
+  - Adafruit ILI9341
+  - XPT2046_Touchscreen
+
+  ESP32 core libraries used by optional apps:
+  - WiFi, HTTPClient, SPIFFS, ArduinoOTA
+
+  Wiring used by this sketch:
+    TFT VCC   -> ESP32 3V3/VCC
+    TFT GND   -> ESP32 GND
+    TFT CS    -> GPIO17
+    TFT RESET -> GPIO5
+    TFT D/C   -> GPIO16
+    TFT MOSI  -> GPIO23
+    TFT SCK   -> GPIO18
+    TFT LED   -> GPIO32
+    TFT MISO  -> GPIO19
+
+    T_CLK     -> GPIO18
+    T_CS      -> GPIO21
+    T_DI      -> GPIO23
+    T_DO      -> GPIO19
+    T_IRQ     -> not connected
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <FS.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoOTA.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h>
+
+#if defined(ESP32)
+#include <esp_arduino_version.h>
+#endif
+
+constexpr uint8_t PIN_SPI_MOSI = 23;
+constexpr uint8_t PIN_SPI_MISO = 19;
+constexpr uint8_t PIN_SPI_SCK = 18;
+
+constexpr uint8_t PIN_TFT_CS = 17;
+constexpr uint8_t PIN_TFT_RST = 5;
+constexpr uint8_t PIN_TFT_DC = 16;
+constexpr uint8_t PIN_TFT_LED = 32;
+
+constexpr uint8_t PIN_TOUCH_CS = 21;
+constexpr uint8_t PIN_TOUCH_IRQ = 255;  // T_IRQ is not connected; use SPI polling.
+
+// Optional WiFi settings. Leave empty to use the WiFi Manager app as a soft AP.
+const char *WIFI_SSID = "";
+const char *WIFI_PASS = "";
+const char *WEATHER_URL = "";  // Example API text URL can go here.
+const char *WEB_URL = "http://example.com";
+
+constexpr int16_t TOUCH_MIN_X = 250;
+constexpr int16_t TOUCH_MAX_X = 3850;
+constexpr int16_t TOUCH_MIN_Y = 250;
+constexpr int16_t TOUCH_MAX_Y = 3850;
+constexpr bool TOUCH_SWAP_XY = true;
+constexpr bool TOUCH_INVERT_X = false;
+constexpr bool TOUCH_INVERT_Y = true;
+constexpr uint16_t TOUCH_MIN_PRESSURE = 250;
+
+constexpr uint8_t DISPLAY_ROTATION = 1;
+constexpr uint8_t BACKLIGHT_CHANNEL = 0;
+constexpr uint16_t BACKLIGHT_FREQ = 5000;
+constexpr uint8_t BACKLIGHT_BITS = 8;
+constexpr int16_t STATUS_H = 25;
+constexpr int16_t TASKBAR_Y = 210;
+constexpr int16_t SCREEN_W = 320;
+constexpr int16_t SCREEN_H = 240;
+
+Adafruit_ILI9341 tft(PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
+XPT2046_Touchscreen touch(PIN_TOUCH_CS, PIN_TOUCH_IRQ);
+
+enum Screen {
+  SCREEN_LAUNCHER,
+  SCREEN_APP
+};
+
+enum AppId {
+  APP_CALC,
+  APP_NOTES,
+  APP_CLOCK,
+  APP_CALENDAR,
+  APP_WIFI_SCAN,
+  APP_WEATHER,
+  APP_FILES,
+  APP_SNAKE,
+  APP_TTT,
+  APP_PONG,
+  APP_FEATURES,
+  APP_WIFI_MANAGER,
+  APP_BT,
+  APP_OTA,
+  APP_WEB,
+  APP_MARAUDER,
+  APP_CAMERA,
+  APP_PAINT,
+  APP_TOUCH,
+  APP_SETTINGS
+};
+
+struct TouchPoint {
+  bool down = false;
+  int16_t x = 0;
+  int16_t y = 0;
+  int16_t rawX = 0;
+  int16_t rawY = 0;
+  int16_t z = 0;
+};
+
+struct Rect {
+  int16_t x;
+  int16_t y;
+  int16_t w;
+  int16_t h;
+};
+
+struct AppMeta {
+  AppId id;
+  const char *name;
+  const char *icon;
+  uint16_t color;
+};
+
+const AppMeta APPS[] = {
+  {APP_CALC, "Calculator", "CL", ILI9341_CYAN},
+  {APP_NOTES, "Notes", "NO", ILI9341_YELLOW},
+  {APP_CLOCK, "Clock", "CK", ILI9341_GREENYELLOW},
+  {APP_CALENDAR, "Calendar", "CA", ILI9341_ORANGE},
+  {APP_WIFI_SCAN, "WiFi Scan", "WF", ILI9341_BLUE},
+  {APP_WEATHER, "Weather", "WT", ILI9341_CYAN},
+  {APP_FILES, "Files", "FL", ILI9341_GREEN},
+  {APP_SNAKE, "Snake", "SN", ILI9341_GREENYELLOW},
+  {APP_TTT, "TicTacToe", "TT", ILI9341_MAGENTA},
+  {APP_PONG, "Pong", "PG", ILI9341_WHITE},
+  {APP_FEATURES, "ESP32 Info", "32", ILI9341_LIGHTGREY},
+  {APP_WIFI_MANAGER, "WiFi Mgr", "WM", ILI9341_BLUE},
+  {APP_BT, "Bluetooth", "BT", ILI9341_CYAN},
+  {APP_OTA, "OTA", "OT", ILI9341_ORANGE},
+  {APP_WEB, "Web", "WB", ILI9341_GREEN},
+  {APP_MARAUDER, "Marauder", "MR", ILI9341_RED},
+  {APP_CAMERA, "Camera", "CM", ILI9341_PINK},
+  {APP_PAINT, "Paint", "PA", ILI9341_MAGENTA},
+  {APP_TOUCH, "Touch", "TO", ILI9341_CYAN},
+  {APP_SETTINGS, "Quick Set", "QS", ILI9341_DARKGREY}
+};
+
+constexpr uint8_t APP_COUNT = sizeof(APPS) / sizeof(APPS[0]);
+constexpr uint8_t APPS_PER_PAGE = 12;
+
+Screen currentScreen = SCREEN_LAUNCHER;
+AppId currentApp = APP_CALC;
+uint8_t launcherPage = 0;
+bool touchWasDown = false;
+uint32_t lastTouchChange = 0;
+uint32_t lastClockDraw = 0;
+uint32_t lastTouchDraw = 0;
+uint32_t lastGameTick = 0;
+uint8_t backlightValue = 220;
+bool darkMode = true;
+bool otaReady = false;
+String toastText = "";
+uint32_t toastUntil = 0;
+
+String calcDisplay = "0";
+double calcLeft = 0;
+char calcOp = 0;
+bool calcFresh = true;
+
+char noteText[140] = "";
+uint8_t noteLen = 0;
+
+uint16_t brushColor = ILI9341_CYAN;
+
+int8_t snakeX[90];
+int8_t snakeY[90];
+uint8_t snakeLen = 4;
+int8_t snakeDirX = 1;
+int8_t snakeDirY = 0;
+int8_t foodX = 10;
+int8_t foodY = 6;
+bool snakeOver = false;
+
+char ttt[9];
+bool tttOver = false;
+
+float pongX = 160;
+float pongY = 120;
+float pongVX = 2.2;
+float pongVY = 1.8;
+int16_t pongPlayerX = 160;
+int16_t pongAiX = 160;
+uint8_t pongPlayerScore = 0;
+uint8_t pongAiScore = 0;
+
+uint16_t cBg() { return darkMode ? 0x0841 : ILI9341_WHITE; }
+uint16_t cPanel() { return darkMode ? 0x18E3 : 0xDEFB; }
+uint16_t cPanel2() { return darkMode ? 0x2945 : 0xBDF7; }
+uint16_t cText() { return darkMode ? ILI9341_WHITE : ILI9341_BLACK; }
+uint16_t cMuted() { return darkMode ? ILI9341_LIGHTGREY : ILI9341_DARKGREY; }
+uint16_t cAccent() { return darkMode ? ILI9341_CYAN : ILI9341_BLUE; }
+
+bool inRect(const TouchPoint &p, const Rect &r) {
+  return p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
+}
+
+int16_t clampToScreenX(int32_t v) { return constrain(v, 0, tft.width() - 1); }
+int16_t clampToScreenY(int32_t v) { return constrain(v, 0, tft.height() - 1); }
+
+void setBacklight(uint8_t value) {
+  backlightValue = value;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PIN_TFT_LED, backlightValue);
+#else
+  ledcWrite(BACKLIGHT_CHANNEL, backlightValue);
+#endif
+}
+
+void setupBacklight() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_TFT_LED, BACKLIGHT_FREQ, BACKLIGHT_BITS);
+#else
+  ledcSetup(BACKLIGHT_CHANNEL, BACKLIGHT_FREQ, BACKLIGHT_BITS);
+  ledcAttachPin(PIN_TFT_LED, BACKLIGHT_CHANNEL);
+#endif
+  setBacklight(backlightValue);
+}
+
+void centeredText(const char *text, int16_t x, int16_t y, int16_t w, int16_t h,
+                  uint16_t color, uint8_t size) {
+  int16_t x1;
+  int16_t y1;
+  uint16_t tw;
+  uint16_t th;
+  tft.setTextSize(size);
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &tw, &th);
+  tft.setTextColor(color);
+  tft.setCursor(x + (w - tw) / 2, y + (h - th) / 2);
+  tft.print(text);
+}
+
+void button(const Rect &r, const char *label, uint16_t fill, uint8_t size = 1) {
+  tft.fillRoundRect(r.x, r.y, r.w, r.h, 5, fill);
+  tft.drawRoundRect(r.x, r.y, r.w, r.h, 5, cPanel2());
+  centeredText(label, r.x, r.y, r.w, r.h, cText(), size);
+}
+
+void toast(const String &message) {
+  toastText = message;
+  toastUntil = millis() + 1800;
+  tft.fillRoundRect(18, 189, 284, 19, 4, ILI9341_BLACK);
+  tft.drawRoundRect(18, 189, 284, 19, 4, cAccent());
+  centeredText(toastText.c_str(), 18, 189, 284, 19, ILI9341_WHITE, 1);
+}
+
+void animation() {
+  for (int16_t x = 0; x < SCREEN_W; x += 20) {
+    tft.fillRect(x, STATUS_H, 12, SCREEN_H - STATUS_H, cPanel());
+    delay(5);
+  }
+}
+
+void statusBar(const char *title, bool back) {
+  tft.fillRect(0, 0, SCREEN_W, STATUS_H, darkMode ? ILI9341_BLACK : 0xCE79);
+  tft.drawFastHLine(0, STATUS_H - 1, SCREEN_W, cPanel2());
+  if (back) {
+    tft.fillRoundRect(3, 3, 35, 19, 4, cPanel2());
+    centeredText("<", 3, 2, 35, 19, cText(), 2);
+    tft.setCursor(45, 7);
+  } else {
+    tft.setCursor(8, 7);
+  }
+  tft.setTextSize(1);
+  tft.setTextColor(cText());
+  tft.print(title);
+  uint32_t seconds = millis() / 1000;
+  char uptime[12];
+  snprintf(uptime, sizeof(uptime), "%02lu:%02lu", seconds / 60, seconds % 60);
+  tft.setCursor(SCREEN_W - 39, 7);
+  tft.setTextColor(cMuted());
+  tft.print(uptime);
+}
+
+void appShell(const char *title) {
+  currentScreen = SCREEN_APP;
+  tft.fillScreen(cBg());
+  statusBar(title, true);
+}
+
+void taskbar() {
+  tft.fillRect(0, TASKBAR_Y, SCREEN_W, 30, darkMode ? ILI9341_BLACK : 0xCE79);
+  tft.drawFastHLine(0, TASKBAR_Y, SCREEN_W, cPanel2());
+  button({8, 215, 52, 20}, "<", cPanel2(), 2);
+  button({134, 215, 52, 20}, "QS", cPanel2(), 1);
+  button({260, 215, 52, 20}, ">", cPanel2(), 2);
+  char pageLabel[16];
+  snprintf(pageLabel, sizeof(pageLabel), "%u/%u", launcherPage + 1, (APP_COUNT + APPS_PER_PAGE - 1) / APPS_PER_PAGE);
+  centeredText(pageLabel, 0, 217, SCREEN_W, 16, cMuted(), 1);
+}
+
+void drawLauncher() {
+  currentScreen = SCREEN_LAUNCHER;
+  tft.fillScreen(cBg());
+  statusBar("ESP32 Mini OS", false);
+
+  uint8_t start = launcherPage * APPS_PER_PAGE;
+  for (uint8_t i = 0; i < APPS_PER_PAGE; i++) {
+    uint8_t index = start + i;
+    if (index >= APP_COUNT) {
+      break;
+    }
+    uint8_t col = i % 4;
+    uint8_t row = i / 4;
+    int16_t x = 9 + col * 78;
+    int16_t y = 34 + row * 57;
+    const AppMeta &app = APPS[index];
+    tft.fillRoundRect(x, y, 68, 49, 6, cPanel());
+    tft.drawRoundRect(x, y, 68, 49, 6, cPanel2());
+    tft.fillCircle(x + 34, y + 17, 13, app.color);
+    centeredText(app.icon, x + 21, y + 8, 26, 18, ILI9341_BLACK, 1);
+    centeredText(app.name, x + 2, y + 32, 64, 12, cText(), 1);
+  }
+  taskbar();
+}
+
+void drawSplash() {
+  tft.fillScreen(cBg());
+  tft.fillCircle(160, 76, 31, cAccent());
+  tft.fillCircle(160, 76, 18, cBg());
+  centeredText("ESP32", 0, 116, SCREEN_W, 28, cText(), 3);
+  centeredText("Mini OS", 0, 151, SCREEN_W, 20, cAccent(), 2);
+  centeredText("Touch launcher + apps", 0, 184, SCREEN_W, 16, cMuted(), 1);
+  delay(800);
+}
+
+TouchPoint readTouch() {
+  TouchPoint out;
+  if (!touch.touched()) {
+    return out;
+  }
+  TS_Point raw = touch.getPoint();
+  if (raw.z < TOUCH_MIN_PRESSURE) {
+    return out;
+  }
+
+  out.down = true;
+  out.rawX = raw.x;
+  out.rawY = raw.y;
+  out.z = raw.z;
+
+  int32_t srcX = TOUCH_SWAP_XY ? raw.y : raw.x;
+  int32_t srcY = TOUCH_SWAP_XY ? raw.x : raw.y;
+  int16_t minX = TOUCH_SWAP_XY ? TOUCH_MIN_Y : TOUCH_MIN_X;
+  int16_t maxX = TOUCH_SWAP_XY ? TOUCH_MAX_Y : TOUCH_MAX_X;
+  int16_t minY = TOUCH_SWAP_XY ? TOUCH_MIN_X : TOUCH_MIN_Y;
+  int16_t maxY = TOUCH_SWAP_XY ? TOUCH_MAX_X : TOUCH_MAX_Y;
+
+  int32_t mappedX = map(srcX, minX, maxX, 0, tft.width() - 1);
+  int32_t mappedY = map(srcY, minY, maxY, 0, tft.height() - 1);
+  if (TOUCH_INVERT_X) mappedX = tft.width() - 1 - mappedX;
+  if (TOUCH_INVERT_Y) mappedY = tft.height() - 1 - mappedY;
+
+  out.x = clampToScreenX(mappedX);
+  out.y = clampToScreenY(mappedY);
+  return out;
+}
+
+bool backPressed(const TouchPoint &p, bool justPressed) {
+  return justPressed && currentScreen == SCREEN_APP && p.x < 43 && p.y < STATUS_H;
+}
+
+void lineText(const char *label, const String &value, int16_t y) {
+  tft.setTextSize(1);
+  tft.setTextColor(cMuted());
+  tft.setCursor(18, y);
+  tft.print(label);
+  tft.setTextColor(cText());
+  tft.setCursor(122, y);
+  tft.print(value);
+}
+
+void drawTextPage(const char *title, const char *a, const char *b, const char *c, const char *d) {
+  appShell(title);
+  tft.fillRoundRect(12, 40, 296, 151, 5, cPanel());
+  tft.drawRoundRect(12, 40, 296, 151, 5, cPanel2());
+  tft.setTextSize(1);
+  tft.setTextColor(cText());
+  tft.setCursor(24, 56);
+  tft.print(a);
+  tft.setCursor(24, 78);
+  tft.print(b);
+  tft.setCursor(24, 100);
+  tft.print(c);
+  tft.setCursor(24, 122);
+  tft.print(d);
+}
+
+void drawCalc() {
+  appShell("Calculator");
+  tft.fillRoundRect(12, 34, 296, 33, 5, cPanel());
+  tft.setTextSize(2);
+  tft.setTextColor(cText());
+  tft.setCursor(22, 43);
+  tft.print(calcDisplay);
+
+  const char *keys[4][4] = {
+    {"7", "8", "9", "/"},
+    {"4", "5", "6", "*"},
+    {"1", "2", "3", "-"},
+    {"C", "0", "=", "+"}
+  };
+  for (uint8_t r = 0; r < 4; r++) {
+    for (uint8_t c = 0; c < 4; c++) {
+      button({18 + c * 74, 78 + r * 36, 63, 29}, keys[r][c], c == 3 ? cAccent() : cPanel2(), 2);
+    }
+  }
+}
+
+void calcKey(char key) {
+  if (key >= '0' && key <= '9') {
+    if (calcFresh || calcDisplay == "0") {
+      calcDisplay = "";
+      calcFresh = false;
+    }
+    if (calcDisplay.length() < 12) calcDisplay += key;
+    drawCalc();
+    return;
+  }
+  if (key == 'C') {
+    calcDisplay = "0";
+    calcLeft = 0;
+    calcOp = 0;
+    calcFresh = true;
+    drawCalc();
+    return;
+  }
+  if (key == '+' || key == '-' || key == '*' || key == '/') {
+    calcLeft = calcDisplay.toDouble();
+    calcOp = key;
+    calcFresh = true;
+    toast(String("Operator ") + key);
+    return;
+  }
+  if (key == '=' && calcOp) {
+    double right = calcDisplay.toDouble();
+    double result = calcLeft;
+    if (calcOp == '+') result += right;
+    if (calcOp == '-') result -= right;
+    if (calcOp == '*') result *= right;
+    if (calcOp == '/' && right != 0) result /= right;
+    calcDisplay = String(result, 2);
+    calcOp = 0;
+    calcFresh = true;
+    drawCalc();
+  }
+}
+
+void drawNotes() {
+  appShell("Notes");
+  tft.fillRoundRect(10, 33, 300, 55, 5, cPanel());
+  tft.drawRoundRect(10, 33, 300, 55, 5, cPanel2());
+  tft.setTextSize(1);
+  tft.setTextColor(cText());
+  tft.setCursor(18, 44);
+  tft.print(noteText);
+
+  const char *rows[] = {"ABCDEFGH", "IJKLMNOP", "QRSTUVWX"};
+  for (uint8_t r = 0; r < 3; r++) {
+    for (uint8_t c = 0; c < 8; c++) {
+      char label[2] = {rows[r][c], '\0'};
+      button({10 + c * 38, 98 + r * 29, 33, 24}, label, cPanel2(), 1);
+    }
+  }
+  button({10, 185, 33, 24}, "Y", cPanel2(), 1);
+  button({48, 185, 33, 24}, "Z", cPanel2(), 1);
+  button({91, 185, 67, 24}, "Space", cPanel2(), 1);
+  button({168, 185, 59, 24}, "Del", cPanel2(), 1);
+  button({237, 185, 70, 24}, "Clear", cPanel2(), 1);
+}
+
+void noteAdd(char c) {
+  if (noteLen >= sizeof(noteText) - 2) return;
+  noteText[noteLen++] = c;
+  noteText[noteLen] = '\0';
+  drawNotes();
+}
+
+void drawClock() {
+  appShell("Clock");
+  uint32_t s = millis() / 1000;
+  uint32_t h = s / 3600;
+  uint8_t m = (s / 60) % 60;
+  uint8_t sec = s % 60;
+  char buf[18];
+  snprintf(buf, sizeof(buf), "%02lu:%02u:%02u", h, m, sec);
+  centeredText(buf, 0, 78, SCREEN_W, 48, cAccent(), 4);
+  centeredText("Uptime clock. Add NTP for real time.", 0, 153, SCREEN_W, 16, cMuted(), 1);
+  lastClockDraw = millis();
+}
+
+void drawCalendar() {
+  appShell("Calendar");
+  centeredText(__DATE__, 0, 34, SCREEN_W, 22, cAccent(), 2);
+  const char *days = "S  M  T  W  T  F  S";
+  centeredText(days, 0, 66, SCREEN_W, 14, cMuted(), 1);
+  uint8_t n = 1;
+  for (uint8_t r = 0; r < 5; r++) {
+    for (uint8_t c = 0; c < 7; c++) {
+      int16_t x = 29 + c * 38;
+      int16_t y = 91 + r * 23;
+      if (n <= 31) {
+        char day[4];
+        snprintf(day, sizeof(day), "%u", n++);
+        centeredText(day, x, y, 24, 16, cText(), 1);
+      }
+    }
+  }
+  centeredText("Uses compile date unless you add RTC/NTP.", 0, 215, SCREEN_W, 12, cMuted(), 1);
+}
+
+void drawWiFiList(const char *title, bool safeMode) {
+  appShell(title);
+  button({232, 31, 72, 24}, "Scan", cAccent(), 1);
+  if (safeMode) {
+    centeredText("Safe mode: scan/RSSI/channels only.", 0, 60, SCREEN_W, 12, ILI9341_RED, 1);
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(cMuted());
+  tft.setCursor(16, safeMode ? 80 : 60);
+  tft.print("Scanning...");
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false);
+  delay(100);
+  int n = WiFi.scanNetworks();
+  tft.fillRect(12, safeMode ? 78 : 58, 296, 128, cBg());
+  if (n <= 0) {
+    centeredText("No networks found", 0, 102, SCREEN_W, 16, cMuted(), 1);
+    return;
+  }
+  for (uint8_t i = 0; i < min(n, 6); i++) {
+    int16_t y = (safeMode ? 82 : 62) + i * 20;
+    tft.setCursor(16, y);
+    tft.setTextColor(cText());
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() > 18) ssid = ssid.substring(0, 18);
+    tft.print(ssid);
+    tft.setCursor(178, y);
+    tft.setTextColor(cMuted());
+    tft.print(WiFi.RSSI(i));
+    tft.print(" dBm ch ");
+    tft.print(WiFi.channel(i));
+  }
+}
+
+void drawHttpText(const char *title, const char *url, const char *emptyText) {
+  appShell(title);
+  tft.setTextSize(1);
+  tft.setTextColor(cText());
+  if (url[0] == '\0') {
+    centeredText(emptyText, 10, 75, 300, 20, cMuted(), 1);
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    centeredText("WiFi is not connected.", 0, 74, SCREEN_W, 16, cMuted(), 1);
+    centeredText("Use WiFi Mgr or set SSID/PASS.", 0, 94, SCREEN_W, 16, cMuted(), 1);
+    return;
+  }
+  centeredText("Loading...", 0, 70, SCREEN_W, 16, cMuted(), 1);
+  HTTPClient http;
+  http.begin(url);
+  int code = http.GET();
+  tft.fillRect(10, 52, 300, 142, cBg());
+  if (code <= 0) {
+    centeredText("HTTP request failed", 0, 92, SCREEN_W, 16, ILI9341_RED, 1);
+    http.end();
+    return;
+  }
+  String payload = http.getString();
+  http.end();
+  payload.replace("\n", " ");
+  tft.setCursor(16, 56);
+  for (uint16_t i = 0; i < min((uint16_t)payload.length(), (uint16_t)260); i++) {
+    tft.print(payload[i]);
+    if (i % 42 == 41) tft.println();
+  }
+}
+
+void drawFiles() {
+  appShell("File Browser");
+  if (!SPIFFS.begin(true)) {
+    centeredText("SPIFFS mount failed", 0, 92, SCREEN_W, 16, ILI9341_RED, 1);
+    return;
+  }
+  File root = SPIFFS.open("/");
+  File file = root.openNextFile();
+  uint8_t row = 0;
+  while (file && row < 7) {
+    String name = file.name();
+    if (name.length() > 24) name = name.substring(0, 24);
+    lineText(name.c_str(), String(file.size()) + " B", 48 + row * 20);
+    file = root.openNextFile();
+    row++;
+  }
+  if (row == 0) {
+    centeredText("No SPIFFS files yet", 0, 95, SCREEN_W, 16, cMuted(), 1);
+  }
+}
+
+void drawFeatures() {
+  appShell("ESP32 Features");
+  String wifiStatus = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("not connected");
+  lineText("Chip", String(ESP.getChipModel()), 48);
+  lineText("CPU", String(ESP.getCpuFreqMHz()) + " MHz", 68);
+  lineText("Heap", String(ESP.getFreeHeap() / 1024) + " KB", 88);
+  lineText("Flash", String(ESP.getFlashChipSize() / 1024 / 1024) + " MB", 108);
+  lineText("WiFi", wifiStatus, 128);
+  lineText("Touch IRQ", "not connected", 148);
+  lineText("Display", "ILI9341 320x240", 168);
+}
+
+void drawWiFiManager() {
+  appShell("WiFi Manager");
+  String wifiStatus = WiFi.status() == WL_CONNECTED ? String("connected") : String("not connected");
+  String ipText = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  button({25, 58, 125, 35}, "Connect", cAccent(), 1);
+  button({170, 58, 125, 35}, "Soft AP", cPanel2(), 1);
+  lineText("Status", wifiStatus, 122);
+  lineText("IP", ipText, 144);
+  centeredText("Set WIFI_SSID/PASS in the sketch for station mode.", 0, 183, SCREEN_W, 14, cMuted(), 1);
+}
+
+void drawOTA() {
+  appShell("OTA Updates");
+  button({86, 66, 148, 36}, "Start OTA", cAccent(), 1);
+  if (otaReady) {
+    centeredText("OTA is listening on WiFi.", 0, 126, SCREEN_W, 16, cText(), 1);
+  } else {
+    centeredText("Connect WiFi first, then start OTA.", 0, 126, SCREEN_W, 16, cMuted(), 1);
+  }
+}
+
+void drawSettings() {
+  appShell("Quick Settings");
+  centeredText("Backlight", 0, 50, SCREEN_W, 16, cText(), 2);
+  uint16_t pct = map(backlightValue, 0, 255, 0, 100);
+  int16_t fillW = map(backlightValue, 0, 255, 0, 248);
+  tft.fillRoundRect(36, 88, 248, 23, 5, cPanel());
+  tft.fillRoundRect(36, 88, fillW, 23, 5, cAccent());
+  tft.drawRoundRect(36, 88, 248, 23, 5, cPanel2());
+  char label[8];
+  snprintf(label, sizeof(label), "%u%%", pct);
+  centeredText(label, 0, 118, SCREEN_W, 16, cText(), 1);
+  button({45, 153, 98, 34}, darkMode ? "Dark On" : "Dark Off", cPanel2(), 1);
+  button({177, 153, 98, 34}, "Notify", cPanel2(), 1);
+}
+
+void drawPaint() {
+  appShell("Paint");
+  button({49, 31, 67, 25}, "Clear", cPanel2(), 1);
+  const uint16_t colors[] = {ILI9341_CYAN, ILI9341_RED, ILI9341_YELLOW, ILI9341_GREEN, ILI9341_WHITE};
+  for (uint8_t i = 0; i < 5; i++) {
+    int16_t cx = 143 + i * 31;
+    tft.fillCircle(cx, 43, 10, colors[i]);
+    tft.drawCircle(cx, 43, 11, colors[i] == brushColor ? cText() : cPanel2());
+  }
+  tft.drawRect(8, 63, SCREEN_W - 16, SCREEN_H - 70, cPanel2());
+}
+
+void clearPaintCanvas() {
+  tft.fillRect(9, 64, SCREEN_W - 18, SCREEN_H - 72, cBg());
+  tft.drawRect(8, 63, SCREEN_W - 16, SCREEN_H - 70, cPanel2());
+}
+
+void drawTouchTest() {
+  appShell("Touch Test");
+  centeredText("Touch the screen to see raw + mapped data.", 0, 47, SCREEN_W, 14, cMuted(), 1);
+  tft.drawRect(13, 83, 294, 112, cPanel2());
+}
+
+void drawTouchValues(const TouchPoint &p) {
+  tft.fillRect(20, 92, 280, 93, cBg());
+  lineText("Raw X", String(p.rawX), 100);
+  lineText("Raw Y", String(p.rawY), 120);
+  lineText("Pressure", String(p.z), 140);
+  lineText("Mapped", String(p.x) + "," + String(p.y), 160);
+  tft.fillCircle(constrain(p.x, 16, 304), constrain(p.y, 86, 190), 4, ILI9341_ORANGE);
+}
+
+void resetSnake() {
+  snakeLen = 4;
+  snakeDirX = 1;
+  snakeDirY = 0;
+  snakeOver = false;
+  for (uint8_t i = 0; i < snakeLen; i++) {
+    snakeX[i] = 5 - i;
+    snakeY[i] = 5;
+  }
+  foodX = random(1, 15);
+  foodY = random(1, 10);
+}
+
+void drawSnake() {
+  appShell("Snake");
+  tft.drawRect(8, 34, 208, 156, cPanel2());
+  button({236, 74, 42, 28}, "^", cPanel2(), 2);
+  button({190, 112, 42, 28}, "<", cPanel2(), 2);
+  button({236, 112, 42, 28}, "v", cPanel2(), 2);
+  button({282, 112, 32, 28}, ">", cPanel2(), 2);
+  centeredText("Tap board to reset", 218, 164, 98, 14, cMuted(), 1);
+}
+
+void paintSnakeBoard() {
+  tft.fillRect(9, 35, 206, 154, cBg());
+  for (uint8_t i = 0; i < snakeLen; i++) {
+    tft.fillRect(12 + snakeX[i] * 12, 38 + snakeY[i] * 12, 10, 10, ILI9341_GREEN);
+  }
+  tft.fillRect(12 + foodX * 12, 38 + foodY * 12, 10, 10, ILI9341_RED);
+  if (snakeOver) centeredText("GAME OVER", 24, 96, 170, 18, ILI9341_RED, 2);
+}
+
+void stepSnake() {
+  if (snakeOver) return;
+  int8_t nx = snakeX[0] + snakeDirX;
+  int8_t ny = snakeY[0] + snakeDirY;
+  if (nx < 0 || nx > 16 || ny < 0 || ny > 12) {
+    snakeOver = true;
+    return;
+  }
+  for (uint8_t i = 0; i < snakeLen; i++) {
+    if (snakeX[i] == nx && snakeY[i] == ny) {
+      snakeOver = true;
+      return;
+    }
+  }
+  for (int8_t i = snakeLen; i > 0; i--) {
+    snakeX[i] = snakeX[i - 1];
+    snakeY[i] = snakeY[i - 1];
+  }
+  snakeX[0] = nx;
+  snakeY[0] = ny;
+  if (nx == foodX && ny == foodY) {
+    if (snakeLen < 85) snakeLen++;
+    foodX = random(1, 16);
+    foodY = random(1, 12);
+  }
+}
+
+void resetTTT() {
+  for (uint8_t i = 0; i < 9; i++) ttt[i] = ' ';
+  tttOver = false;
+}
+
+char tttWinner() {
+  const uint8_t wins[8][3] = {{0,1,2},{3,4,5},{6,7,8},{0,3,6},{1,4,7},{2,5,8},{0,4,8},{2,4,6}};
+  for (uint8_t i = 0; i < 8; i++) {
+    char a = ttt[wins[i][0]];
+    if (a != ' ' && a == ttt[wins[i][1]] && a == ttt[wins[i][2]]) return a;
+  }
+  for (uint8_t i = 0; i < 9; i++) if (ttt[i] == ' ') return 0;
+  return 'D';
+}
+
+void drawTTT() {
+  appShell("Tic Tac Toe");
+  tft.drawRect(75, 42, 171, 171, cPanel2());
+  tft.drawFastVLine(132, 42, 171, cPanel2());
+  tft.drawFastVLine(189, 42, 171, cPanel2());
+  tft.drawFastHLine(75, 99, 171, cPanel2());
+  tft.drawFastHLine(75, 156, 171, cPanel2());
+  for (uint8_t i = 0; i < 9; i++) {
+    char s[2] = {ttt[i], '\0'};
+    centeredText(s, 75 + (i % 3) * 57, 42 + (i / 3) * 57, 57, 57, ttt[i] == 'X' ? cAccent() : ILI9341_ORANGE, 3);
+  }
+  char w = tttWinner();
+  if (w) {
+    String msg;
+    if (w == 'D') {
+      msg = "Draw";
+    } else {
+      msg = String(w) + " wins";
+    }
+    centeredText(msg.c_str(), 0, 216, SCREEN_W, 14, cMuted(), 1);
+    tttOver = true;
+  }
+}
+
+void drawPong() {
+  appShell("Pong");
+  tft.drawRect(10, 34, 300, 170, cPanel2());
+}
+
+void paintPong() {
+  tft.fillRect(11, 35, 298, 168, cBg());
+  tft.fillRect(pongAiX - 28, 42, 56, 5, ILI9341_ORANGE);
+  tft.fillRect(pongPlayerX - 28, 194, 56, 5, cAccent());
+  tft.fillCircle((int16_t)pongX, (int16_t)pongY, 4, cText());
+}
+
+void stepPong() {
+  pongAiX += (pongX - pongAiX) * 0.08;
+  pongX += pongVX;
+  pongY += pongVY;
+  if (pongX < 15 || pongX > 305) pongVX = -pongVX;
+  if (pongY < 51 && abs((int)pongX - pongAiX) < 33) pongVY = abs(pongVY);
+  if (pongY > 189 && abs((int)pongX - pongPlayerX) < 33) pongVY = -abs(pongVY);
+  if (pongY < 34) {
+    pongPlayerScore++;
+    pongX = 160;
+    pongY = 120;
+  }
+  if (pongY > 204) {
+    pongAiScore++;
+    pongX = 160;
+    pongY = 120;
+  }
+}
+
+void openApp(AppId id) {
+  currentApp = id;
+  animation();
+  if (id == APP_CALC) drawCalc();
+  if (id == APP_NOTES) drawNotes();
+  if (id == APP_CLOCK) drawClock();
+  if (id == APP_CALENDAR) drawCalendar();
+  if (id == APP_WIFI_SCAN) drawWiFiList("WiFi Scanner", false);
+  if (id == APP_WEATHER) drawHttpText("Weather", WEATHER_URL, "Set WEATHER_URL for live weather.");
+  if (id == APP_FILES) drawFiles();
+  if (id == APP_SNAKE) { resetSnake(); drawSnake(); paintSnakeBoard(); }
+  if (id == APP_TTT) { resetTTT(); drawTTT(); }
+  if (id == APP_PONG) { drawPong(); paintPong(); }
+  if (id == APP_FEATURES) drawFeatures();
+  if (id == APP_WIFI_MANAGER) drawWiFiManager();
+  if (id == APP_BT) drawTextPage("Bluetooth Control", "Bluetooth control screen is ready.", "Add BluetoothSerial/BLE commands for", "your ESP32 board and project.", "Some ESP32-S3 boards have no classic BT.");
+  if (id == APP_OTA) drawOTA();
+  if (id == APP_WEB) drawHttpText("Web Browser", WEB_URL, "Set WEB_URL for a text page.");
+  if (id == APP_MARAUDER) drawWiFiList("Safe Marauder Tools", true);
+  if (id == APP_CAMERA) drawTextPage("Camera Support", "Needs ESP32-CAM or camera pins.", "This ESP32 DevKit wiring has no camera.", "Add esp_camera config for your board.", "Screen preview can be added next.");
+  if (id == APP_PAINT) drawPaint();
+  if (id == APP_TOUCH) drawTouchTest();
+  if (id == APP_SETTINGS) drawSettings();
+}
+
+void handleLauncher(const TouchPoint &p, bool justPressed) {
+  if (!justPressed) return;
+  if (p.y >= TASKBAR_Y) {
+    if (p.x < 75 && launcherPage > 0) {
+      launcherPage--;
+      drawLauncher();
+    } else if (p.x > 245 && (launcherPage + 1) * APPS_PER_PAGE < APP_COUNT) {
+      launcherPage++;
+      drawLauncher();
+    } else if (p.x > 115 && p.x < 205) {
+      openApp(APP_SETTINGS);
+    }
+    return;
+  }
+  uint8_t col = p.x / 78;
+  uint8_t row = (p.y - 34) / 57;
+  if (p.y < 34 || row > 2 || col > 3) return;
+  uint8_t index = launcherPage * APPS_PER_PAGE + row * 4 + col;
+  if (index < APP_COUNT) openApp(APPS[index].id);
+}
+
+void handleCalc(const TouchPoint &p, bool justPressed) {
+  if (!justPressed) return;
+  if (p.y < 78) return;
+  uint8_t col = (p.x - 18) / 74;
+  uint8_t row = (p.y - 78) / 36;
+  if (row > 3 || col > 3) return;
+  const char keys[4][4] = {{'7','8','9','/'},{'4','5','6','*'},{'1','2','3','-'},{'C','0','=','+'}};
+  calcKey(keys[row][col]);
+}
+
+void handleNotes(const TouchPoint &p, bool justPressed) {
+  if (!justPressed) return;
+  if (p.y >= 98 && p.y < 185) {
+    uint8_t row = (p.y - 98) / 29;
+    uint8_t col = p.x / 38;
+    const char *rows[] = {"ABCDEFGH", "IJKLMNOP", "QRSTUVWX"};
+    if (row < 3 && col < 8) noteAdd(rows[row][col]);
+  } else if (p.y >= 185) {
+    if (p.x < 43) noteAdd('Y');
+    else if (p.x < 81) noteAdd('Z');
+    else if (p.x < 158) noteAdd(' ');
+    else if (p.x < 227 && noteLen > 0) {
+      noteText[--noteLen] = '\0';
+      drawNotes();
+    } else if (p.x >= 237) {
+      noteLen = 0;
+      noteText[0] = '\0';
+      drawNotes();
+    }
+  }
+}
+
+void handleWiFiManager(const TouchPoint &p, bool justPressed) {
+  if (!justPressed) return;
+  if (inRect(p, {25, 58, 125, 35})) {
+    if (strlen(WIFI_SSID) == 0) {
+      toast("Set WIFI_SSID/PASS first");
+      return;
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    toast("Connecting...");
+  } else if (inRect(p, {170, 58, 125, 35})) {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-MiniOS");
+    drawWiFiManager();
+    toast("Soft AP started");
+  }
+}
+
+void handleOTA(const TouchPoint &p, bool justPressed) {
+  if (!justPressed || !inRect(p, {86, 66, 148, 36})) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    toast("WiFi needed for OTA");
+    return;
+  }
+  ArduinoOTA.setHostname("esp32-minios");
+  ArduinoOTA.begin();
+  otaReady = true;
+  drawOTA();
+  toast("OTA ready");
+}
+
+void handleSettings(const TouchPoint &p, bool touched, bool justPressed) {
+  if (touched && p.y >= 88 && p.y <= 111 && p.x >= 36 && p.x <= 284) {
+    setBacklight(constrain(map(p.x, 36, 284, 5, 255), 5, 255));
+    drawSettings();
+  } else if (justPressed && inRect(p, {45, 153, 98, 34})) {
+    darkMode = !darkMode;
+    drawSettings();
+  } else if (justPressed && inRect(p, {177, 153, 98, 34})) {
+    toast("Notification test");
+  }
+}
+
+void handlePaint(const TouchPoint &p, bool touched, bool justPressed) {
+  if (justPressed && inRect(p, {49, 31, 67, 25})) {
+    clearPaintCanvas();
+    return;
+  }
+  if (justPressed && p.y >= 28 && p.y <= 58) {
+    const uint16_t colors[] = {ILI9341_CYAN, ILI9341_RED, ILI9341_YELLOW, ILI9341_GREEN, ILI9341_WHITE};
+    for (uint8_t i = 0; i < 5; i++) {
+      int16_t cx = 143 + i * 31;
+      int16_t dx = p.x - cx;
+      int16_t dy = p.y - 43;
+      if (dx * dx + dy * dy <= 14 * 14) {
+        brushColor = colors[i];
+        drawPaint();
+        return;
+      }
+    }
+  }
+  if (touched && p.y > 66) tft.fillCircle(p.x, p.y, 3, brushColor);
+}
+
+void handleSnake(const TouchPoint &p, bool justPressed) {
+  if (justPressed) {
+    if (inRect(p, {236, 74, 42, 28}) && snakeDirY != 1) { snakeDirX = 0; snakeDirY = -1; }
+    if (inRect(p, {236, 112, 42, 28}) && snakeDirY != -1) { snakeDirX = 0; snakeDirY = 1; }
+    if (inRect(p, {190, 112, 42, 28}) && snakeDirX != 1) { snakeDirX = -1; snakeDirY = 0; }
+    if (inRect(p, {282, 112, 32, 28}) && snakeDirX != -1) { snakeDirX = 1; snakeDirY = 0; }
+    if (snakeOver && inRect(p, {8, 34, 208, 156})) resetSnake();
+  }
+  if (millis() - lastGameTick > 180) {
+    stepSnake();
+    paintSnakeBoard();
+    lastGameTick = millis();
+  }
+}
+
+void handleTTT(const TouchPoint &p, bool justPressed) {
+  if (!justPressed) return;
+  if (tttOver) {
+    resetTTT();
+    drawTTT();
+    return;
+  }
+  if (p.x < 75 || p.x >= 246 || p.y < 42 || p.y >= 213) return;
+  uint8_t col = (p.x - 75) / 57;
+  uint8_t row = (p.y - 42) / 57;
+  uint8_t idx = row * 3 + col;
+  if (ttt[idx] != ' ') return;
+  ttt[idx] = 'X';
+  if (!tttWinner()) {
+    for (uint8_t i = 0; i < 9; i++) {
+      if (ttt[i] == ' ') {
+        ttt[i] = 'O';
+        break;
+      }
+    }
+  }
+  drawTTT();
+}
+
+void handlePong(const TouchPoint &p, bool touched) {
+  if (touched && p.y > 40) pongPlayerX = constrain(p.x, 38, 282);
+  if (millis() - lastGameTick > 30) {
+    stepPong();
+    paintPong();
+    lastGameTick = millis();
+  }
+}
+
+void handleApp(const TouchPoint &p, bool touched, bool justPressed) {
+  if (backPressed(p, justPressed)) {
+    drawLauncher();
+    return;
+  }
+  if ((currentApp == APP_WIFI_SCAN || currentApp == APP_MARAUDER) && justPressed && inRect(p, {232, 31, 72, 24})) {
+    drawWiFiList(currentApp == APP_WIFI_SCAN ? "WiFi Scanner" : "Safe Marauder Tools", currentApp == APP_MARAUDER);
+  }
+  if (currentApp == APP_CALC) handleCalc(p, justPressed);
+  if (currentApp == APP_NOTES) handleNotes(p, justPressed);
+  if (currentApp == APP_CLOCK && millis() - lastClockDraw > 1000) drawClock();
+  if (currentApp == APP_WIFI_MANAGER) handleWiFiManager(p, justPressed);
+  if (currentApp == APP_OTA) handleOTA(p, justPressed);
+  if (currentApp == APP_SETTINGS) handleSettings(p, touched, justPressed);
+  if (currentApp == APP_PAINT) handlePaint(p, touched, justPressed);
+  if (currentApp == APP_TOUCH && touched && millis() - lastTouchDraw > 60) {
+    drawTouchValues(p);
+    lastTouchDraw = millis();
+  }
+  if (currentApp == APP_SNAKE) handleSnake(p, justPressed);
+  if (currentApp == APP_TTT) handleTTT(p, justPressed);
+  if (currentApp == APP_PONG) handlePong(p, touched);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  randomSeed(analogRead(0));
+
+  pinMode(PIN_TFT_CS, OUTPUT);
+  pinMode(PIN_TOUCH_CS, OUTPUT);
+  digitalWrite(PIN_TFT_CS, HIGH);
+  digitalWrite(PIN_TOUCH_CS, HIGH);
+
+  setupBacklight();
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  tft.begin();
+  tft.setRotation(DISPLAY_ROTATION);
+  touch.begin();
+  SPIFFS.begin(true);
+
+  drawSplash();
+  drawLauncher();
+}
+
+void loop() {
+  if (otaReady) ArduinoOTA.handle();
+
+  TouchPoint p = readTouch();
+  bool oldTouch = touchWasDown;
+  bool justPressed = p.down && !oldTouch && (millis() - lastTouchChange > 60);
+  if (p.down != oldTouch) {
+    touchWasDown = p.down;
+    lastTouchChange = millis();
+  }
+
+  if (currentScreen == SCREEN_LAUNCHER) {
+    handleLauncher(p, justPressed);
+  } else {
+    handleApp(p, p.down, justPressed);
+  }
+
+  delay(8);
+}
